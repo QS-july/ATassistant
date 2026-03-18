@@ -1,6 +1,6 @@
 # ATassistant
 
-[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![License](https://img.shields.io/badge/license-GPL-blue.svg)](LICENSE)
 [![Release](https://img.shields.io/github/v/release/QS-July/ATassistant?include_prereleases)](https://github.com/QS-July/ATassistant/releases)
 [![Downloads](https://img.shields.io/github/downloads/QS-July/ATassistant/total)](https://github.com/QS-July/ATassistant/releases)
 
