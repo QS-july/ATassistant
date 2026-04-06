@@ -1,4 +1,4 @@
-<Project Sdk="Microsoft.NET.Sdk">
+﻿<Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
     <TargetFramework>net8.0-windows</TargetFramework>
@@ -7,24 +7,29 @@
     <UseWindowsForms>true</UseWindowsForms>
     <ImplicitUsings>enable</ImplicitUsings>
     
+    <!-- 单文件发布配置（不剪裁） -->
     <PublishSingleFile>true</PublishSingleFile>
     <SelfContained>true</SelfContained>
     <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
     <DebugType>embedded</DebugType>
     <DebugSymbols>false</DebugSymbols>
     
+    <!-- 移除剪裁相关行 -->
     <!-- <PublishTrimmed>true</PublishTrimmed> -->
     <!-- <TrimMode>partial</TrimMode> -->
     
+    <!-- 可选：移除全球化数据以减小体积 -->
     <InvariantGlobalization>true</InvariantGlobalization>
   </PropertyGroup>
 
+  <!-- 图标条件配置 -->
   <PropertyGroup Condition="Exists('rsc\icon.ico')">
     <ApplicationIcon>rsc\icon.ico</ApplicationIcon>
   </PropertyGroup>
 
   <ItemGroup>
     <PackageReference Include="Newtonsoft.Json" Version="13.0.4" />
+    <!-- 其他包引用 -->
   </ItemGroup>
 
   <ItemGroup>

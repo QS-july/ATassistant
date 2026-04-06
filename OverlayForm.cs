@@ -7,73 +7,64 @@ namespace HLL_ATassistant
 {
     public class OverlayForm : Form
     {
-        private MainForm _mainForm;
+        private readonly MainForm _mainForm;
         private Label lblDisplay;
-        private System.Windows.Forms.Timer timer;
-        private double? _alpha, _v2g;
 
         public OverlayForm(MainForm mainForm)
         {
             _mainForm = mainForm;
             InitializeComponent();
-        }
 
-        public void SetCalibration(double alpha, double v2g)
-        {
-            _alpha = alpha;
-            _v2g = v2g;
+            // 订阅事件，实现实时刷新
+            _mainForm.DeltaChanged += (s, delta) => UpdateDisplay();
+            _mainForm.Settings.PropertyChanged += (s, e) => UpdateDisplay();
+            _mainForm.Engine.CalibrationChanged += () => UpdateDisplay();
+
+            // 初始刷新一次
             UpdateDisplay();
         }
 
-        public void ApplyLanguage()
-        {
-            UpdateDisplay(); // 刷新显示，使状态信息语言更新
-        }
-
-        private void Timer_Tick(object sender, EventArgs e)
-        {
-            UpdateDisplay();
-        }
+        public void RefreshDisplay() => UpdateDisplay();
+        public void ApplyLanguage() => UpdateDisplay();
 
         private void UpdateDisplay()
         {
             if (_mainForm == null) return;
 
-            // double delta = _mainForm.SmoothedDelta;
             double delta = _mainForm.CurrentDelta;
             double maxDelta = _mainForm.MaxCalibratedDelta;
 
-            if (_alpha.HasValue && _v2g.HasValue)
+            if (_mainForm.Alpha != 0 && _mainForm.V2G != 0)
             {
                 if (delta <= 0)
                 {
-                    lblDisplay.Text = "D: ---  θ: 0°";
+                    lblDisplay.Text = _mainForm.GetString("DisplayNoMovement", null);
                     return;
                 }
                 if (delta > maxDelta)
                 {
-                    lblDisplay.Text = _mainForm.GetString("DisplayOutofCali", maxDelta);
+                    lblDisplay.Text = string.Format(_mainForm.GetString("DisplayOutofCali", null), maxDelta);
                     return;
                 }
 
-                double thetaRad = _alpha.Value * delta;
+                double thetaRad = _mainForm.Alpha * delta;
                 double twoTheta = 2 * thetaRad;
                 if (twoTheta <= 0 || twoTheta >= Math.PI)
                 {
-                    lblDisplay.Text = _mainForm.GetString("DisplayOutofAngle");
+                    lblDisplay.Text = _mainForm.GetString("DisplayOutofAngle", null);
                     return;
                 }
 
-                double D = _v2g.Value * Math.Sin(twoTheta);
+                double D = _mainForm.V2G * Math.Sin(twoTheta);
                 double thetaDeg = thetaRad * 180 / Math.PI;
                 double v = _mainForm.Velocity;
 
                 List<string> lines = new List<string>();
 
-                // ===== 普通测量模式 =====
+                // 普通模式
                 if (!(_mainForm.IsHeightDiffModeEnabled && _mainForm.IsHeightDiffBaselineSet))
                 {
-                    // 第一行：D 和 θ
+                    // 第一行
                     if (_mainForm.ShowDistance && _mainForm.ShowAngle)
                         lines.Add($"D: {D:F1}m  θ: {thetaDeg:F1}°");
                     else if (_mainForm.ShowDistance)
@@ -81,46 +72,35 @@ namespace HLL_ATassistant
                     else if (_mainForm.ShowAngle)
                         lines.Add($"θ: {thetaDeg:F1}°");
 
-                    // 第二行：t 和 vx（t 在前，vx 在后）
+                    // 第二行
                     if (_mainForm.ShowTime || _mainForm.ShowVx)
                     {
                         double vx = v * Math.Cos(thetaRad);
                         string secondLine = "";
                         if (_mainForm.ShowTime)
-                        {
-                            if (Math.Abs(vx) > 1e-6)
-                                secondLine += $"t: {D / vx:F2}s";
-                            else
-                                secondLine += "t: ---";
-                        }
+                            secondLine += (Math.Abs(vx) > 1e-6) ? $"t: {D / vx:F2}s" : "t: ---";
                         if (_mainForm.ShowVx)
                         {
-                            if (!string.IsNullOrEmpty(secondLine)) secondLine += "  ";
+                            if (secondLine.Length > 0) secondLine += "  ";
                             secondLine += $"vx: {vx:F1}m/s";
                         }
                         lines.Add(secondLine);
                     }
                 }
-                else // ===== 高低差测量模式 =====
+                else  // 高低差模式
                 {
                     double delta0 = _mainForm.HeightDiffDelta0;
-                    double delta1 = delta;
-                    double alpha = _alpha.Value;
-                    double v2g = _v2g.Value;
-
-                    // 计算 X
-                    double X = v2g * Math.Sin(2 * alpha * (delta0 + delta1));
-                    // 计算 L
-                    double cosDelta0 = Math.Cos(alpha * delta0);
-                    double sinDelta1 = Math.Sin(alpha * delta1);
-                    double L = 2 * v2g * sinDelta1 / (cosDelta0 * cosDelta0);
+                    double X = _mainForm.V2G * Math.Sin(2 * _mainForm.Alpha * (delta0 + delta));
+                    double cosDelta0 = Math.Cos(_mainForm.Alpha * delta0);
+                    double sinDelta1 = Math.Sin(_mainForm.Alpha * delta);
+                    double L = 2 * _mainForm.V2G * sinDelta1 / (cosDelta0 * cosDelta0);
                     if (double.IsInfinity(L) || double.IsNaN(L)) L = 0;
 
                     double betaDeg = _mainForm.BetaAngle * 180 / Math.PI;
-                    double thetaEffective = thetaRad + _mainForm.BetaAngle; // 总射角（弧度）
+                    double thetaEffective = thetaRad + _mainForm.BetaAngle;
                     double vx = v * Math.Cos(thetaEffective);
 
-                    // 第一行：D 和 θ（与普通模式一致）
+                    // 第一行
                     if (_mainForm.ShowDistance && _mainForm.ShowAngle)
                         lines.Add($"D: {D:F1}m  θ: {thetaDeg:F1}°");
                     else if (_mainForm.ShowDistance)
@@ -128,42 +108,32 @@ namespace HLL_ATassistant
                     else if (_mainForm.ShowAngle)
                         lines.Add($"θ: {thetaDeg:F1}°");
 
-                    // 第二行：L, β, X
-                    List<string> secondRowItems = new List<string>();
-                    if (_mainForm.ShowL) secondRowItems.Add($"L: {L:F1}m");
-                    if (_mainForm.ShowBeta) secondRowItems.Add($"β: {betaDeg:F1}°");
-                    if (_mainForm.ShowX) secondRowItems.Add($"X: {X:F1}m");
-                    if (secondRowItems.Count > 0)
-                        lines.Add(string.Join("  ", secondRowItems));
+                    // 第二行
+                    List<string> secondRow = new List<string>();
+                    if (_mainForm.ShowL) secondRow.Add($"L: {L:F1}m");
+                    if (_mainForm.ShowBeta) secondRow.Add($"β: {betaDeg:F1}°");
+                    if (_mainForm.ShowX) secondRow.Add($"X: {X:F1}m");
+                    if (secondRow.Count > 0) lines.Add(string.Join("  ", secondRow));
 
-                    // 第三行：t', t, vx
-                    List<string> thirdRowItems = new List<string>();
+                    // 第三行
+                    List<string> thirdRow = new List<string>();
                     if (_mainForm.ShowTPrime)
-                    {
-                        if (Math.Abs(vx) > 1e-6)
-                            thirdRowItems.Add($"t': {L / vx:F2}s");
-                        else
-                            thirdRowItems.Add("t': ---");
-                    }
+                        thirdRow.Add((Math.Abs(vx) > 1e-6) ? $"t': {L / vx:F2}s" : "t': ---");
                     if (_mainForm.ShowTime)
                     {
                         double vxNormal = v * Math.Cos(thetaRad);
-                        if (Math.Abs(vxNormal) > 1e-6)
-                            thirdRowItems.Add($"t: {D / vxNormal:F2}s");
-                        else
-                            thirdRowItems.Add("t: ---");
+                        thirdRow.Add((Math.Abs(vxNormal) > 1e-6) ? $"t: {D / vxNormal:F2}s" : "t: ---");
                     }
                     if (_mainForm.ShowVx)
-                        thirdRowItems.Add($"vx: {vx:F1}m/s");
-                    if (thirdRowItems.Count > 0)
-                        lines.Add(string.Join("  ", thirdRowItems));
+                        thirdRow.Add($"vx: {vx:F1}m/s");
+                    if (thirdRow.Count > 0) lines.Add(string.Join("  ", thirdRow));
                 }
 
                 lblDisplay.Text = string.Join("\n", lines);
             }
             else
             {
-                lblDisplay.Text = _mainForm.GetString("DisplayWaitforCali");
+                lblDisplay.Text = _mainForm.GetString("DisplayWaitforCali", null);
             }
         }
 
@@ -174,7 +144,7 @@ namespace HLL_ATassistant
             ShowInTaskbar = false;
             BackColor = Color.Magenta;
             TransparencyKey = Color.Magenta;
-            Size = new Size(300, 180); // 增加高度以容纳三行
+            Size = new Size(300, 180);
             StartPosition = FormStartPosition.Manual;
 
             lblDisplay = new Label
@@ -183,8 +153,7 @@ namespace HLL_ATassistant
                 TextAlign = ContentAlignment.MiddleCenter,
                 Font = new Font("微软雅黑", 14, FontStyle.Bold),
                 ForeColor = Color.White,
-                BackColor = Color.Transparent,
-                UseCompatibleTextRendering = true
+                BackColor = Color.Transparent
             };
             Controls.Add(lblDisplay);
 
@@ -193,10 +162,6 @@ namespace HLL_ATassistant
                 var screen = Screen.PrimaryScreen.WorkingArea;
                 Location = new Point(screen.Width / 2 + Width / 2, screen.Height / 2);
             };
-
-            timer = new System.Windows.Forms.Timer { Interval = 50 };
-            timer.Tick += Timer_Tick;
-            timer.Start();
         }
 
         protected override CreateParams CreateParams

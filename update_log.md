@@ -218,11 +218,11 @@ L为当前角度下，落在自己与目标连线上的距离；X为当前角度
 ③ `L = 4 * k * α * δ1 / (1 + sqrt(1 - square(α) * square(δ0))) / (1 + sqrt(1 - square(α) * square(δ1)))`  
 其中 ③ 是计算机最易计算的，使用它作为主函数。  
 
-![alt text](image.png)
+![alt text](rsc/image.png)
 
 ——额，错了，之前的等量关系是`θ = α * d`（`α` 是比例系数），所以化简得到的应该是：
 `L = 2 * k * sin(α * δ1) / (cos(α * δ0) ^ 2)`
-![alt text](image-1.png)
+![alt text](rsc/image-1.png)
 
 
 
@@ -266,4 +266,18 @@ debug:
 4. 删除平滑系数，保证示数准确。
 
 ### beta ver. 1.40
-rawinput替换hook
+1. 使用了rawinput替换hook，解决了顶头问题和精细度问题。
+2. 大幅重构代码逻辑，提升可读性、硬件占用，优化了性能。
+HLL_ATassistant/
+├── AppSettings.cs          // 应用设置（热键、显示选项等），支持自动保存和变更通知
+├── CalibrationEngine.cs    // 校准算法、物理量、多点拟合
+├── MouseDeltaTracker.cs    // 鼠标原始输入处理、位移累积
+├── HotKeyManager.cs        // 系统热键注册/注销与事件
+├── LanguageManager.cs      // 多语言管理
+├── OverlayForm.cs          // 透明覆盖窗口，事件驱动刷新
+├── SettingForm.cs          // 设置窗口，直接绑定 AppSettings
+├── MainForm.cs             // 主窗口，协调各组件，仅保留 UI 逻辑
+└── Program.cs              // 程序入口
+3. 增加了系统托盘图标右键菜单
+4. 增加了页面位置存储功能，再打开时会从关闭时位置跳出
+5. 增加了系统托盘图标
