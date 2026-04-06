@@ -1,200 +1,485 @@
 using System;
-using System.Collections.Generic;
 using System.Drawing;
 using System.Linq;
-using System.Threading.Tasks;
 using System.Windows.Forms;
 using Newtonsoft.Json;
+using System.IO;
+using System.Threading.Tasks;
+using System.Reflection;
+using System.IO;
+
 
 namespace HLL_ATassistant
 {
-    /// <summary>
-    /// 主窗体类，负责UI交互、校准逻辑和鼠标钩子管理。
-    /// </summary>
     public partial class MainForm : Form
     {
-        // 状态机：空闲、测量中、多点校准中
+        // 组件
+        private readonly AppSettings _settings;
+        private readonly CalibrationEngine _engine;
+        private readonly MouseDeltaTracker _mouseTracker;
+        private HotKeyManager _hotKeyManager;
+        private OverlayForm _overlay;
+
+        // 状态机
         private enum Mode { Idle, Measuring, MultiCalibrating }
         private Mode _currentMode = Mode.Idle;
+        private int _currentPointIndex;
 
-        // 物理量
-        private double _alpha;          // 射角系数
-        private double _v2g;             // v²/g
-        private double _v = 100.0;       // 初速度 (m/s)
-        private double _g = 9.8;         // 重力加速度 (m/s²)
-
-        // 高低差测量模式
-        private bool _enableHeightDiffMode = false;
-        private double _heightDiffDelta0 = 0;   // δ₀
-        private int _heightDiffSetBaselineKey = 0;
-        private int _heightDiffSetBaselineModifiers = 0;
-        private int _heightDiffCancelBaselineKey = 0;
-        private int _heightDiffCancelBaselineModifiers = 0;
-        private bool _heightDiffSameKey = false;
+        // 高低差模式专用
+        private bool _enableHeightDiffMode;
+        private double _heightDiffDelta0;
         private enum HeightDiffState { Idle, BaselineSet, Measuring }
         private HeightDiffState _heightDiffState = HeightDiffState.Idle;
-        private CheckBox chkEnableHeightDiff = null!;
 
-        // 鼠标位移累积量
-        private double _currentDelta;
-        // private double _smoothedDelta;
-        // public double SmoothedDelta => _smoothedDelta;
-        private readonly object _deltaLock = new object();
-        private volatile bool _isAccumulating;   // 是否正在累积位移
-        private double _sensitivity = 1.0;        // 灵敏度系数
-        // private double _smoothFactor = 0.2;       // 平滑因子
-        private double _maxDeltaLimit;             // 最大有效位移
+        // UI 控件（由设计器生成，此处仅声明引用）
+        private Label lblMaxRange, lblSensitivity, lblDistances, lblStatus, lblError, lblErrorStats, lblWarning, lblMultiStatus;
+        private NumericUpDown nudSensitivity, nudMaxRange;
+        private CheckBox chkUseBuiltin, chkEnableHeightDiff;
+        private TextBox txtDistances;
+        private Button btnStartMulti, btnReset, btnSave, btnLoad, btnRefresh, btnSettings, btnLanguage;
+        private NotifyIcon notifyIcon;
 
-        // 控件字段
-        private Label lblMaxRange = null!;
-        // private Label lblSmooth = null!;
-        private Label lblSensitivity = null!;
-        private Label lblDistances = null!;
-        private Label lblStatus = null!;
-        private Label lblError = null!;
-        private Label lblErrorStats = null!;
-        private Label lblWarning = null!;
-        private Label lblMultiStatus = null!;
-        private Button btnReset = null!;
-        private Button btnSave = null!;
-        private Button btnLoad = null!;
-        private Button btnRefresh = null!;
-        private Button btnLanguage = null!;
-        private Button btnSettings = null!;
-        private Button btnStartMulti = null!;
-        private NumericUpDown nudSensitivity = null!;
-        private NumericUpDown nudMaxRange = null!;
-        // private NumericUpDown nudSmoothFactor = null!;
-        private CheckBox chkUseBuiltin = null!;
-        private TextBox txtDistances = null!;
-        private NotifyIcon notifyIcon = null!;
-        private OverlayForm overlay = null!;
-        private HotKeySettings _hotKeySettings = null!;
-
-        // 校准点集合
-        private List<CalibrationPoint> _calibrationPoints = new List<CalibrationPoint>();
-        private int _currentPointIndex = -1;
-
-        // 语言枚举
+        // 语言管理
         private enum Language { Chinese, English }
         private Language _currentLanguage = Language.Chinese;
 
-        // 公开属性（供 OverlayForm 使用）
-        public double MaxCalibratedDelta => _maxDeltaLimit;
-        public double CurrentDelta => _currentDelta;
+
+        // 公开属性供 OverlayForm 使用
+        public AppSettings Settings => _settings;
+        public CalibrationEngine Engine => _engine;
+        public double CurrentDelta => _mouseTracker.CurrentDelta;
+        public double MaxCalibratedDelta => _engine.MaxDeltaLimit;
+        public double Alpha => _engine.Alpha;
+        public double V2G => _engine.V2G;
+        public double Velocity => _engine.Velocity;
+
+        public bool ShowDistance => _settings.ShowDistance;
+        public bool ShowAngle => _settings.ShowAngle;
+        public bool ShowVx => _settings.ShowVx;
+        public bool ShowTime => _settings.ShowTime;
+        public bool ShowL => _settings.ShowL;
+        public bool ShowX => _settings.ShowX;
+        public bool ShowBeta => _settings.ShowBeta;
+        public bool ShowTPrime => _settings.ShowTPrime;
+
         public bool IsHeightDiffModeEnabled => _enableHeightDiffMode;
-        public double HeightDiffDelta0 => _heightDiffDelta0;
-        public double Velocity => _v;
-        public double BetaAngle => _alpha * _heightDiffDelta0;   // β = α * δ₀
-
-        // Overlay 显示项（从热键设置中读取）
         public bool IsHeightDiffBaselineSet => _heightDiffState != HeightDiffState.Idle;
-        public bool ShowDistance => _hotKeySettings.ShowDistance;
-        public bool ShowAngle => _hotKeySettings.ShowAngle;
-        public bool ShowL => _hotKeySettings.ShowL;
-        public bool ShowX => _hotKeySettings.ShowX;
-        public bool ShowBeta => _hotKeySettings.ShowBeta;
-        public bool ShowVx => _hotKeySettings.ShowVx;
-        public bool ShowTime => _hotKeySettings.ShowTime;
-        public bool ShowTPrime => _hotKeySettings.ShowTPrime;
+        public double HeightDiffDelta0 => _heightDiffDelta0;
+        public double BetaAngle => _engine.Alpha * _heightDiffDelta0;
+        public event EventHandler<double> DeltaChanged;
+        
 
-
-        /// <summary>
-        /// 构造函数：初始化组件、注册热键、安装鼠标钩子、创建覆盖窗口。
-        /// </summary>
         public MainForm()
         {
-            InitializeComponent();
-            TopMost = true;
+            _settings = AppSettings.Instance;
+            _engine = new CalibrationEngine();
+            _mouseTracker = new MouseDeltaTracker(this.Handle);
+            _hotKeyManager = new HotKeyManager(this.Handle, _settings);
 
-            _hotKeySettings = HotKeySettings.Load();
-            // 加载高低差热键设置
-            _heightDiffSetBaselineKey = _hotKeySettings.SetBaselineKey;
-            _heightDiffSetBaselineModifiers = _hotKeySettings.SetBaselineModifiers;
-            _heightDiffCancelBaselineKey = _hotKeySettings.CancelBaselineKey;
-            _heightDiffCancelBaselineModifiers = _hotKeySettings.CancelBaselineModifiers;
-            _heightDiffSameKey = _hotKeySettings.SameKeyForBaseline;
+            InitializeComponent();  // 设计器生成的控件初始化
 
-            RegisterAllHotKeys();
-            InstallMouseHook();
-
-            overlay = new OverlayForm(this);
-            overlay.Show();
-
-            chkUseBuiltin.Checked = true;
-
-            FormClosing += (s, e) =>
+            // 恢复主窗体位置
+            if (_settings.MainFormLocation.HasValue)
             {
-                UninstallMouseHook();
-                UnregisterHotKey(Handle, HOTKEY_ID_B1);
-                UnregisterHotKey(Handle, HOTKEY_ID_B2);
-                UnregisterHotKey(Handle, HOTKEY_ID_TOGGLE_VISIBLE);
-                UnregisterHotKey(Handle, HOTKEY_ID_TOGGLE_OVERLAY);
-                UnregisterHotKey(Handle, HOTKEY_ID_START_MULTI);
-                notifyIcon.Visible = false;
-                notifyIcon.Dispose();
-                overlay.Close();
+                var loc = _settings.MainFormLocation.Value;
+                // 确保位置在屏幕可见区域内
+                if (IsOnScreen(loc))
+                {
+                    this.StartPosition = FormStartPosition.Manual;
+                    this.Location = loc;
+                }
+            }
+
+            chkEnableHeightDiff.CheckedChanged += ChkEnableHeightDiff_CheckedChanged;
+
+            // 初始化 UI 值与设置同步
+            nudSensitivity.Value = (decimal)_settings.Sensitivity;
+            nudMaxRange.Value = (decimal)_settings.MaxRange;
+            chkUseBuiltin.Checked = _settings.UseFixedMaxRange;
+            chkEnableHeightDiff.Checked = _enableHeightDiffMode;
+
+            // 事件订阅
+            _mouseTracker.DeltaChanged += OnDeltaChanged;
+            _mouseTracker.OnMiddleButtonPressed += () => _hotKeyManager.ProcessHotKey(1);
+
+            _hotKeyManager.B1Pressed += OnB1;
+            _hotKeyManager.B2Pressed += OnB2;
+            _hotKeyManager.ToggleVisiblePressed += ToggleMainFormVisibility;
+            _hotKeyManager.ToggleOverlayPressed += () => _overlay?.Invoke(new Action(() => _overlay.Visible = !_overlay.Visible));
+            _hotKeyManager.StartMultiPressed += () => BtnStartMulti_Click(null, null);
+            _hotKeyManager.SetBaselinePressed += OnSetBaseline;
+            _hotKeyManager.CancelBaselinePressed += OnCancelBaseline;
+
+            _engine.CalibrationChanged += () =>
+            {
+                if (InvokeRequired) BeginInvoke(new Action(() => { UpdateErrorStats(); UpdateAbsoluteErrorStats(); _overlay?.RefreshDisplay(); }));
+                else { UpdateErrorStats(); UpdateAbsoluteErrorStats(); _overlay?.RefreshDisplay(); }
             };
 
+            // 创建 Overlay
+            _overlay = new OverlayForm(this);
+            _overlay.Show();
+
+            // 设置窗体图标（标题栏左侧）
+            string iconPath = Path.Combine(Application.StartupPath, "rsc", "icon.ico");
+            if (File.Exists(iconPath))
+            {
+                this.Icon = new Icon(iconPath);
+            }
+
+            // 加载图标（使用字节数组，避免流位置问题）
+            try
+            {
+                // 嵌入式资源的名称：默认命名空间 + 文件夹名 + 文件名
+                string resourceName = "HLL_ATassistant.rsc.icon.ico";
+                using (var stream = Assembly.GetExecutingAssembly().GetManifestResourceStream(resourceName))
+                {
+                    if (stream != null && stream.Length > 0)
+                    {
+                        // 读取全部字节到数组
+                        byte[] iconBytes = new byte[stream.Length];
+                        stream.Read(iconBytes, 0, iconBytes.Length);
+                        
+                        // 为窗体图标创建独立内存流
+                        using (var ms = new MemoryStream(iconBytes))
+                        {
+                            this.Icon = new Icon(ms);
+                        }
+                        // 为托盘图标创建独立内存流
+                        using (var ms = new MemoryStream(iconBytes))
+                        {
+                            notifyIcon.Icon = new Icon(ms);
+                        }
+                    }
+                    else
+                    {
+                        notifyIcon.Icon = SystemIcons.Application;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                // 任何加载失败的情况都使用系统默认图标，程序不会崩溃
+                System.Diagnostics.Debug.WriteLine($"图标加载失败: {ex.Message}");
+                notifyIcon.Icon = SystemIcons.Application;
+            }
+
+            ContextMenuStrip trayMenu = new ContextMenuStrip();
+            ToolStripMenuItem settingsItem = new ToolStripMenuItem("设置");
+            ToolStripMenuItem exitItem = new ToolStripMenuItem("退出");
+            settingsItem.Click += (s, e) => BtnSettings_Click(null, null);
+            exitItem.Click += (s, e) => Application.Exit();
+            trayMenu.Items.Add(settingsItem);
+            trayMenu.Items.Add(exitItem);
+            notifyIcon.ContextMenuStrip = trayMenu;
+
+            // 托盘双击-显示
+            notifyIcon.DoubleClick += (s, e) =>
+            {
+                this.Show();
+                this.WindowState = FormWindowState.Normal;
+            };
+
+            // 其他初始化
+            TopMost = true;
             ApplyLanguage();
-            UpdateVFromV2G();
+            UpdateStatus(GetString("StatusIdle"));
         }
 
-        private void UpdateVFromV2G()
-        {
-            _v = (_v2g > 0 && _g > 0) ? Math.Sqrt(_v2g * _g) : 0;
-        }
 
-        private void UpdateStatus(string text)
+        #region 鼠标位移变化处理
+        private void OnDeltaChanged(double delta)
         {
-            if (InvokeRequired)
+            if (InvokeRequired) { BeginInvoke(new Action<double>(OnDeltaChanged), delta); return; }
+            DeltaChanged?.Invoke(this, delta);
+        }
+        #endregion
+
+        #region 热键行为
+        private void OnB1()
+        {
+            switch (_currentMode)
             {
-                BeginInvoke(new Action<string>(UpdateStatus), text);
+                case Mode.Idle:
+                    ShowError("Error_NeedCalibFirst", 2000);
+                    break;
+
+                case Mode.MultiCalibrating:
+                    // 重置位移，开始累积
+                    _mouseTracker.Reset();
+                    _mouseTracker.StartAccumulating();
+                    UpdateStatus(GetString("Msg_StatusMeasurePoint",
+                        _currentPointIndex + 1, _engine.Points[_currentPointIndex].Distance));
+                    break;
+
+                case Mode.Measuring:
+                    if (_enableHeightDiffMode)
+                    {
+                        if (_heightDiffState == HeightDiffState.BaselineSet)
+                        {
+                            _mouseTracker.Reset();
+                            _heightDiffState = HeightDiffState.Measuring;
+                            _mouseTracker.StartAccumulating();
+                            UpdateStatus(GetString("Msg_StatusMeasuring"));
+                        }
+                        else if (_heightDiffState == HeightDiffState.Idle)
+                        {
+                            _mouseTracker.Reset();
+                            _mouseTracker.StartAccumulating();
+                            ShowError("Error_NeedBaselineFirst", 2000);
+                            UpdateStatus(GetString("Msg_StatusMeasuringNormal"));
+                        }
+                        else if (_heightDiffState == HeightDiffState.Measuring)
+                        {
+                            _mouseTracker.Reset();
+                            UpdateStatus(GetString("Msg_StatusMeasuringReset"));
+                        }
+                    }
+                    else
+                    {
+                        _mouseTracker.Reset();
+                        _mouseTracker.StartAccumulating();
+                        UpdateStatus(GetString("Msg_StatusMeasuring"));
+                    }
+                    break;
+            }
+        }
+
+        private void OnB2()
+        {
+            switch (_currentMode)
+            {
+                case Mode.MultiCalibrating:
+                    if (_mouseTracker.CurrentDelta > 0)
+                    {
+                        // 记录当前位移到当前标定点
+                        _engine.Points[_currentPointIndex].Delta = _mouseTracker.CurrentDelta;
+                        _currentPointIndex++;
+                        if (_currentPointIndex < _engine.Points.Count)
+                        {
+                            _mouseTracker.Reset();
+                            UpdateStatus(GetString("Msg_StatusNextPoint",
+                                _currentPointIndex + 1, _engine.Points[_currentPointIndex].Distance));
+                        }
+                        else
+                        {
+                            _mouseTracker.StopAccumulating();
+                            PerformCalibration();  // 拟合多点
+                        }
+                    }
+                    else
+                    {
+                        ShowError("请移动鼠标后再按确认键", 3000);
+                        _mouseTracker.Reset();
+                        _mouseTracker.StartAccumulating();
+                    }
+                    break;
+
+                case Mode.Measuring:
+                    _mouseTracker.StopAccumulating();
+                    UpdateStatus(GetString("Msg_StatusPaused"));
+                    break;
+            }
+        }
+
+        private void PerformCalibration()
+        {
+            try
+            {
+                bool useFixed = _settings.UseFixedMaxRange;  // 或 chkUseBuiltin.Checked
+                double fixedRange = (double)nudMaxRange.Value;
+                _engine.FitMultiPoints(useFixed, fixedRange);
+                _currentMode = Mode.Measuring;
+                _mouseTracker.Reset();
+                _mouseTracker.StartAccumulating();
+                UpdateStatus(GetString("Msg_StatusCalibComplete", _engine.Alpha, _engine.V2G));
+            }
+            catch (Exception ex)
+            {
+                ShowError(ex.Message, 3000);
+                _currentMode = Mode.Idle;
+            }
+        }
+
+        private void ToggleMainFormVisibility()
+        {
+            if (WindowState == FormWindowState.Minimized || !Visible)
+            {
+                Show();
+                WindowState = FormWindowState.Normal;
+            }
+            else
+            {
+                Hide();
+            }
+        }
+
+        private void OnSetBaseline()
+        {
+            if (!_enableHeightDiffMode) return;
+            if (_settings.SameKeyForBaseline && _heightDiffState != HeightDiffState.Idle)
+            {
+                OnCancelBaseline();
                 return;
             }
-            lblStatus.Text = text;
+            _heightDiffDelta0 = _mouseTracker.CurrentDelta;
+            _mouseTracker.Reset();
+            _heightDiffState = HeightDiffState.BaselineSet;
+            _mouseTracker.StopAccumulating();
+            UpdateStatus(GetString("Msg_BaselineSet"));
         }
 
-        private async void ShowErrorMessage(string message, int timeoutMs)
+        private void OnCancelBaseline()
         {
-            if (InvokeRequired)
+            if (!_enableHeightDiffMode) return;
+            _heightDiffState = HeightDiffState.Idle;
+            _mouseTracker.Reset();
+            UpdateStatus(GetString("Msg_BaselineCancelled"));
+        }
+        #endregion
+
+        #region 按钮事件
+        private void BtnStartMulti_Click(object sender, EventArgs e)
+        {
+            var distances = txtDistances.Text
+                .Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries)
+                .Select(line => double.TryParse(line.Trim(), out double d) ? d : (double?)null)
+                .Where(d => d.HasValue)
+                .Select(d => d.Value)
+                .ToList();
+
+            if (distances.Count < 2)
             {
-                BeginInvoke(new Action<string, int>(ShowErrorMessage), message, timeoutMs);
+                ShowError("Error_NeedTwoDistances", 2000);
                 return;
             }
-            lblError.Text = message;
-            if (timeoutMs > 0)
+
+            _engine.Points.Clear();
+            foreach (var d in distances)
+                _engine.Points.Add(new CalibrationPoint { Distance = d, Delta = 0 });
+
+            _currentPointIndex = 0;
+            _currentMode = Mode.MultiCalibrating;
+            _mouseTracker.StopAccumulating();
+            UpdateStatus(GetString("Msg_StatusMultiStart", _engine.Points[0].Distance));
+        }
+
+        private void BtnReset_Click(object sender, EventArgs e)
+        {
+            _currentMode = Mode.Idle;
+            _heightDiffState = HeightDiffState.Idle;
+            _mouseTracker.StopAccumulating();
+            _mouseTracker.Reset();
+            _engine.Reset();
+            UpdateStatus(GetString("Msg_StatusReset"));
+            lblErrorStats.Text = GetString("ErrorStatsDefault");
+            lblMultiStatus.Text = "";
+        }
+
+        private void BtnSave_Click(object sender, EventArgs e)
+        {
+            if (_engine.Points.Count == 0 && (_engine.Alpha == 0 || _engine.V2G == 0))
             {
-                await Task.Delay(timeoutMs);
-                lblError.Text = "";
+                ShowError("Error_NoCalibData", 2000);
+                return;
+            }
+
+            using (var sfd = new SaveFileDialog { Filter = "JSON 文件|*.json", DefaultExt = "json", FileName = "calibration.json" })
+            {
+                if (sfd.ShowDialog() == DialogResult.OK)
+                {
+                    try
+                    {
+                        var data = _engine.ExportData();
+                        string json = JsonConvert.SerializeObject(data, Formatting.Indented);
+                        File.WriteAllText(sfd.FileName, json);
+                        ShowError("Msg_CalibSaved", 2000);
+                    }
+                    catch (Exception ex) { ShowError($"保存失败: {ex.Message}", 3000); }
+                }
             }
         }
 
-        public class CalibrationPoint
+        private void BtnLoad_Click(object sender, EventArgs e)
         {
-            public double Distance { get; set; }
-            public double Delta { get; set; }
+            using (var ofd = new OpenFileDialog { Filter = "JSON 文件|*.json" })
+            {
+                if (ofd.ShowDialog() == DialogResult.OK)
+                {
+                    try
+                    {
+                        string json = File.ReadAllText(ofd.FileName);
+                        var data = JsonConvert.DeserializeObject<CalibrationData>(json);
+                        if (data == null) throw new Exception(GetString("Error_InvalidCalibFile"));
+                        _engine.LoadFromData(data);
+                        if (_settings.UseFixedMaxRange && _engine.Points.Count > 0)
+                            _engine.RecalculateWithFixedRange((double)nudMaxRange.Value);
+                        _currentMode = Mode.Measuring;
+                        _mouseTracker.Reset();
+                        _mouseTracker.StartAccumulating();
+                        UpdateStatus(GetString("Msg_StatusLoadComplete", _engine.Alpha, _engine.V2G));
+                        ShowError("Msg_CalibLoaded", 2000);
+                    }
+                    catch (Exception ex) { ShowError($"加载失败: {ex.Message}", 3000); }
+                }
+            }
         }
 
-        [Serializable]
-        public class CalibrationPointData
+        private void BtnRefresh_Click(object sender, EventArgs e)
         {
-            public double Delta { get; set; }
-            public double Distance { get; set; }
+            if (!_settings.UseFixedMaxRange)
+            {
+                ShowError("Error_FixedRangeNotChecked", 2000);
+                return;
+            }
+            if (_engine.Points.Count == 0)
+            {
+                ShowError("Error_NoPointsToRefresh", 2000);
+                return;
+            }
+            try
+            {
+                _engine.RecalculateWithFixedRange((double)nudMaxRange.Value);
+                UpdateStatus(GetString("Msg_StatusRecalcComplete", _engine.Alpha, _engine.V2G));
+            }
+            catch (Exception ex) { ShowError(ex.Message, 3000); }
         }
 
-        [Serializable]
-        public class CalibrationData
+        private void BtnSettings_Click(object sender, EventArgs e)
         {
-            public List<CalibrationPointData> Points { get; set; } = new List<CalibrationPointData>();
-            public double Alpha { get; set; }
-            public double V2G { get; set; }
-            public double V { get; set; }
-            public double G { get; set; }
-            public double MaxDeltaLimit { get; set; }
+            using (var form = new SettingForm(_settings, this))
+            {
+                form.ShowDialog(this);
+                // 热键变化后重新注册
+                _hotKeyManager.Dispose();
+                // 重新创建 HotKeyManager 以应用新设置
+                var newManager = new HotKeyManager(this.Handle, _settings);
+                // 复制事件订阅
+                newManager.B1Pressed += OnB1;
+                newManager.B2Pressed += OnB2;
+                newManager.ToggleVisiblePressed += ToggleMainFormVisibility;
+                newManager.ToggleOverlayPressed += () => _overlay?.Invoke(new Action(() => _overlay.Visible = !_overlay.Visible));
+                newManager.StartMultiPressed += () => BtnStartMulti_Click(null, null);
+                newManager.SetBaselinePressed += OnSetBaseline;
+                newManager.CancelBaselinePressed += OnCancelBaseline;
+                // 替换旧管理器
+                var old = _hotKeyManager;
+                _hotKeyManager = newManager;
+                old.Dispose();
+                _hotKeyManager.ReRegister();
+
+                ShowError("Msg_HotkeyUpdated", 2000);
+            }
         }
 
-        private void ChkEnableHeightDiff_CheckedChanged(object? sender, EventArgs e)
+        private void BtnLanguage_Click(object sender, EventArgs e)
+        {
+            _currentLanguage = _currentLanguage == Language.Chinese ? Language.English : Language.Chinese;
+            ApplyLanguage();           // 更新主窗体界面
+            _overlay?.ApplyLanguage(); // 更新覆盖窗口界面
+        }
+
+        private void ChkEnableHeightDiff_CheckedChanged(object sender, EventArgs e)
         {
             _enableHeightDiffMode = chkEnableHeightDiff.Checked;
             if (_enableHeightDiffMode)
@@ -207,13 +492,117 @@ namespace HLL_ATassistant
             {
                 lblWarning.Visible = false;
                 _heightDiffState = HeightDiffState.Idle;
-                _isAccumulating = false;
-                lock (_deltaLock)
+                _mouseTracker.StopAccumulating();
+                _mouseTracker.Reset();
+            }
+        }
+
+        private void NudSensitivity_ValueChanged(object sender, EventArgs e)
+        {
+            double newSensitivity = (double)nudSensitivity.Value;
+            if ((_engine.Points.Count > 0 || _engine.Alpha != 0) && _currentMode != Mode.Idle)
+            {
+                var result = MessageBox.Show(
+                    GetString("SensitivityConfirmMessage"),
+                    GetString("SensitivityConfirmTitle"),
+                    MessageBoxButtons.YesNo,
+                    MessageBoxIcon.Warning);
+                if (result == DialogResult.Yes)
                 {
-                    _currentDelta = 0;
-                    // _smoothedDelta = 0;
+                    BtnReset_Click(null, EventArgs.Empty);
+                    _settings.Sensitivity = newSensitivity;
+                    _mouseTracker.SetSensitivity(newSensitivity);
+                }
+                else
+                {
+                    nudSensitivity.ValueChanged -= NudSensitivity_ValueChanged;
+                    nudSensitivity.Value = (decimal)_settings.Sensitivity;
+                    nudSensitivity.ValueChanged += NudSensitivity_ValueChanged;
                 }
             }
+            else
+            {
+                _settings.Sensitivity = newSensitivity;
+                _mouseTracker.SetSensitivity(newSensitivity);
+            }
+        }
+
+        private void ChkUseBuiltin_CheckedChanged(object sender, EventArgs e)
+        {
+            _settings.UseFixedMaxRange = chkUseBuiltin.Checked;
+            btnRefresh.Enabled = chkUseBuiltin.Checked;
+            if (chkUseBuiltin.Checked)
+                lblWarning.Visible = false;
+            else
+            {
+                lblWarning.Text = GetString("WarningNoFixed");
+                lblWarning.ForeColor = Color.Red;
+                lblWarning.Visible = true;
+            }
+        }
+        #endregion
+
+        #region 辅助方法
+        private void UpdateStatus(string text)
+        {
+            if (InvokeRequired) { BeginInvoke(new Action<string>(UpdateStatus), text); return; }
+            lblStatus.Text = text;
+        }
+
+        private void ShowError(string key, int timeoutMs = 3000, params object[] args)
+        {
+            string msg = GetString(key, args);
+            if (InvokeRequired) { BeginInvoke(new Action(() => ShowErrorMessage(msg, timeoutMs))); return; }
+            ShowErrorMessage(msg, timeoutMs);
+        }
+
+        private void ShowErrorMessage(string message, int timeoutMs)
+        {
+            lblError.Text = message;
+            if (timeoutMs > 0)
+                System.Threading.Tasks.Task.Delay(timeoutMs).ContinueWith(_ => { if (!IsDisposed) BeginInvoke(new Action(() => lblError.Text = "")); });
+        }
+
+        private void UpdateErrorStats()
+        {
+            if (_engine.Points.Count == 0 || _engine.Alpha == 0 || _engine.V2G == 0)
+            {
+                lblErrorStats.Text = GetString("ErrorStatsDefault");
+                return;
+            }
+
+            double totalRel = 0, maxRel = 0, maxAbs = 0, maxAbsDist = 0;
+            foreach (var p in _engine.Points)
+            {
+                double pred = _engine.V2G * Math.Sin(2 * _engine.Alpha * p.Delta);
+                double absErr = Math.Abs(pred - p.Distance);
+                double relErr = absErr / p.Distance;
+                totalRel += relErr;
+                if (relErr > maxRel) maxRel = relErr;
+                if (absErr > maxAbs) { maxAbs = absErr; maxAbsDist = p.Distance; }
+            }
+            double avgRel = totalRel / _engine.Points.Count;
+            lblErrorStats.Text = GetString("MultiErrorRatio", avgRel, maxRel, maxAbs, maxAbsDist);
+        }
+
+        private void UpdateAbsoluteErrorStats()
+        {
+            var validPoints = _engine.Points.Where(p => p.Delta > 0).ToList();
+            if (validPoints.Count == 0 || _engine.Alpha == 0 || _engine.V2G == 0)
+            {
+                lblMultiStatus.Text = "";
+                return;
+            }
+            double totalAbs = 0, maxAbs = 0;
+            foreach (var p in validPoints)
+            {
+                double pred = _engine.V2G * Math.Sin(2 * _engine.Alpha * p.Delta);
+                double absErr = Math.Abs(pred - p.Distance);
+                totalAbs += absErr;
+                if (absErr > maxAbs) maxAbs = absErr;
+            }
+            double avgAbs = totalAbs / validPoints.Count;
+            lblMultiStatus.Text = GetString("MultiErrorFormat", avgAbs, maxAbs);
         }
 
         private Button CreateStyledButton(string text, int x, int y, int width, EventHandler clickHandler)
@@ -232,26 +621,64 @@ namespace HLL_ATassistant
             return btn;
         }
 
+        private bool IsOnScreen(Point location)
+        {
+            foreach (var screen in Screen.AllScreens)
+            {
+                if (screen.WorkingArea.Contains(location))
+                    return true;
+            }
+            return false;
+        }
+
+        #endregion
+
+
+        #region 窗体事件
         protected override void WndProc(ref Message m)
         {
-            if (m.Msg == 0x0312) // WM_HOTKEY
+            const int WM_INPUT = 0x00FF;
+            const int WM_HOTKEY = 0x0312;
+            if (m.Msg == WM_INPUT)
+            {
+                _mouseTracker.ProcessRawInput(m.LParam);
+                return;
+            }
+            if (m.Msg == WM_HOTKEY)
             {
                 int id = m.WParam.ToInt32();
-                switch (id)
-                {
-                    case HOTKEY_ID_B1: OnHotKeyB1(); break;
-                    case HOTKEY_ID_B2: OnHotKeyB2(); break;
-                    case HOTKEY_ID_TOGGLE_VISIBLE: ToggleMainFormVisibility(); break;
-                    case HOTKEY_ID_TOGGLE_OVERLAY: ToggleOverlayVisibility(); break;
-                    case HOTKEY_ID_START_MULTI: BtnStartMulti_Click(null, null); break;
-                    case HOTKEY_ID_SET_BASELINE: OnSetBaseline(); break;
-                    case HOTKEY_ID_CANCEL_BASELINE: OnCancelBaseline(); break;
-                }
+                _hotKeyManager.ProcessHotKey(id);
                 return;
             }
             base.WndProc(ref m);
         }
 
+        protected override void OnFormClosing(FormClosingEventArgs e)
+        {
+            // 保存主窗体位置（仅当窗口处于正常状态时）
+            if (this.WindowState == FormWindowState.Normal)
+            {
+                _settings.MainFormLocation = this.Location;
+            }
+            else if (this.WindowState == FormWindowState.Maximized)
+            {
+                // 如果最大化，则保存之前正常状态下的位置（RestoreBounds）
+                _settings.MainFormLocation = this.RestoreBounds.Location;
+            }
+            // 注意：如果是最小化，通常不保存位置（或者可以忽略）
+            
+            _settings.Save();
+
+            // ... 原有的资源释放代码
+            _mouseTracker.Dispose();
+            _hotKeyManager.Dispose();
+            _overlay?.Close();
+            notifyIcon.Visible = false;
+            base.OnFormClosing(e);
+        }
+        #endregion
+
+        #region 窗口排版
         private void InitializeComponent()
         {
             BackColor = Color.FromArgb(30, 30, 30);
@@ -262,9 +689,15 @@ namespace HLL_ATassistant
             FormBorderStyle = FormBorderStyle.FixedDialog;
             MaximizeBox = false;
 
+            // 设置窗体图标（显示在标题栏左侧）
+            string iconPath = Path.Combine(Application.StartupPath, "rsc", "icon.ico");
+            if (File.Exists(iconPath))
+            {
+                this.Icon = new Icon(iconPath);
+            }
+
             int yPos = 20;
 
-            // 最大射程标签
             lblMaxRange = new Label
             {
                 Name = "lblMaxRange",
@@ -275,7 +708,6 @@ namespace HLL_ATassistant
             };
             Controls.Add(lblMaxRange);
 
-            // 数值框
             nudMaxRange = new NumericUpDown
             {
                 Location = new Point(120, yPos - 2),
@@ -287,10 +719,8 @@ namespace HLL_ATassistant
                 BackColor = Color.FromArgb(50, 50, 50),
                 ForeColor = Color.White
             };
-            // nudMaxRange.ValueChanged += NudMaxRange_ValueChanged;            //最大射程随调节框内容显示，留作日后使用
             Controls.Add(nudMaxRange);
 
-            // “使用最大射程”复选框（无文字）
             chkUseBuiltin = new CheckBox
             {
                 Location = new Point(nudMaxRange.Right + 5, yPos + 3),
@@ -298,45 +728,16 @@ namespace HLL_ATassistant
                 Checked = true,
                 BackColor = Color.Transparent,
                 ForeColor = Color.White,
-                Text = ""   
+                Text = ""
             };
             chkUseBuiltin.CheckedChanged += ChkUseBuiltin_CheckedChanged;
             Controls.Add(chkUseBuiltin);
 
-            // 刷新按钮
             btnRefresh = CreateStyledButton("刷新", 220, yPos - 2, 50, BtnRefresh_Click);
             Controls.Add(btnRefresh);
 
             yPos += 30;
 
-            // // 平滑系数
-            // lblSmooth = new Label
-            // {
-            //     Name = "lblSmooth",
-            //     Text = "平滑系数:",
-            //     Location = new Point(10, yPos),
-            //     AutoSize = true,
-            //     ForeColor = Color.White
-            // };
-            // Controls.Add(lblSmooth);
-
-            // nudSmoothFactor = new NumericUpDown
-            // {
-            //     Location = new Point(120, yPos - 2),
-            //     Width = 80,
-            //     Minimum = 0.01m,
-            //     Maximum = 1.0m,
-            //     DecimalPlaces = 2,
-            //     Increment = 0.01m,
-            //     Value = 0.2m,
-            //     BackColor = Color.FromArgb(50, 50, 50),
-            //     ForeColor = Color.White
-            // };
-            // nudSmoothFactor.ValueChanged += NudSmoothFactor_ValueChanged;
-            // Controls.Add(nudSmoothFactor);
-            // yPos += 30;
-
-            // 灵敏度系数
             lblSensitivity = new Label
             {
                 Name = "lblSensitivity",
@@ -363,7 +764,6 @@ namespace HLL_ATassistant
             Controls.Add(nudSensitivity);
             yPos += 30;
 
-            // 高低差测量模式复选框（原“使用最大射程”带文字的位置）
             chkEnableHeightDiff = new CheckBox
             {
                 Text = "启用高低差测量模式",
@@ -376,13 +776,11 @@ namespace HLL_ATassistant
             chkEnableHeightDiff.CheckedChanged += ChkEnableHeightDiff_CheckedChanged;
             Controls.Add(chkEnableHeightDiff);
 
-            // 语言切换按钮
             btnLanguage = CreateStyledButton("English", 210, yPos - 2, 60, BtnLanguage_Click);
             btnLanguage.Anchor = AnchorStyles.Top | AnchorStyles.Right;
             Controls.Add(btnLanguage);
             yPos += 25;
 
-            // 警告标签
             lblWarning = new Label
             {
                 Location = new Point(10, yPos),
@@ -393,7 +791,6 @@ namespace HLL_ATassistant
             Controls.Add(lblWarning);
             yPos += 25;
 
-            // 距离列表标签
             lblDistances = new Label
             {
                 Name = "lblDistances",
@@ -404,7 +801,6 @@ namespace HLL_ATassistant
             };
             Controls.Add(lblDistances);
 
-            // 距离输入框
             txtDistances = new TextBox
             {
                 Location = new Point(120, yPos),
@@ -418,7 +814,6 @@ namespace HLL_ATassistant
             Controls.Add(txtDistances);
             yPos += 65;
 
-            // 功能按钮
             btnStartMulti = CreateStyledButton("开始校准", 10, yPos, 80, BtnStartMulti_Click);
             Controls.Add(btnStartMulti);
 
@@ -458,7 +853,6 @@ namespace HLL_ATassistant
             Controls.Add(btnSettings);
             yPos += 35;
 
-            // 系统托盘图标
             notifyIcon = new NotifyIcon
             {
                 Icon = SystemIcons.Application,
@@ -468,5 +862,6 @@ namespace HLL_ATassistant
             notifyIcon.Click += (s, e) => { Show(); WindowState = FormWindowState.Normal; };
             Resize += (s, e) => { if (WindowState == FormWindowState.Minimized) Hide(); };
         }
+        #endregion
     }
 }
