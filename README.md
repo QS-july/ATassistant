@@ -57,7 +57,6 @@ All settings can be adjusted via the main UI. The following parameters are avail
 | Parameter | Description | Default |
 |-----------|-------------|---------|
 | **Max Range** | Fixed maximum range (used when "Use fixed max range" is checked) | 1000 m |
-| **Smooth Factor** | Exponential smoothing factor for displayed delta (0.01–1.0) | 0.20 |
 | **Sensitivity** | Multiplier for mouse movement sensitivity | 1.00 |
 
 The **"Refresh"** button recalculates the calibration using the current fixed max range (only valid when the checkbox is checked).
