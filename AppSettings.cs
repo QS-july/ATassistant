@@ -1,42 +1,64 @@
 using System;
 using System.ComponentModel;
+using System.Drawing;
 using System.IO;
-using System.Reflection;
 using System.Runtime.CompilerServices;
-using Newtonsoft.Json;
+using System.Text.Json;
+using System.Windows.Forms;
 
 namespace HLL_ATassistant
 {
+    /// <summary>
+    /// 应用程序设置管理：热键配置、显示选项、窗体位置、配置文件的加载与保存。
+    /// 实现 INotifyPropertyChanged 以便 UI 实时响应。
+    /// </summary>
     public class AppSettings : INotifyPropertyChanged
     {
-        // 用户配置存储目录：%LocalAppData%\HLL_ATassistant
+        // 热键修饰符常量（与 Win32 一致）
+        public const int MOD_ALT = 0x0001;
+        public const int MOD_CONTROL = 0x0002;
+        public const int MOD_SHIFT = 0x0004;
+        public const int MOD_WIN = 0x0008;
+
+        // 配置文件路径：%LocalAppData%\HLL_ATassistant\settings.json
         private static readonly string ConfigDir = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
             "HLL_ATassistant");
-        // 配置文件名称：hotkeys.json（兼容旧版）
-        private static readonly string ConfigPath = Path.Combine(ConfigDir, "hotkeys.json");
+        private static readonly string ConfigPath = Path.Combine(ConfigDir, "settings.json");
 
-        private static AppSettings _instance;
+        // 单例实例
+        private static AppSettings? _instance;
         public static AppSettings Instance => _instance ??= Load();
 
-        // 热键属性
-        public int B1Key { get; set; } = (int)System.Windows.Forms.Keys.F1;
-        public int B1Modifiers { get; set; }
-        public int B2Key { get; set; } = (int)System.Windows.Forms.Keys.F2;
-        public int B2Modifiers { get; set; }
-        public int ToggleVisibleKey { get; set; } = (int)System.Windows.Forms.Keys.F3;
-        public int ToggleVisibleModifiers { get; set; }
-        public int ToggleOverlayKey { get; set; } = (int)System.Windows.Forms.Keys.F4;
-        public int ToggleOverlayModifiers { get; set; }
-        public int StartMultiKey { get; set; } = (int)System.Windows.Forms.Keys.F5;
-        public int StartMultiModifiers { get; set; }
-        public int SetBaselineKey { get; set; }
-        public int SetBaselineModifiers { get; set; }
-        public int CancelBaselineKey { get; set; }
-        public int CancelBaselineModifiers { get; set; }
-        public bool SameKeyForBaseline { get; set; }
+        // ========== 热键属性 ==========
+        public int B1Key { get; set; } = (int)MouseButtons.Middle;
+        public int B1Modifiers { get; set; } = 0;
 
-        // 显示选项（带通知）
+        public int B2Key { get; set; } = (int)Keys.X;
+        public int B2Modifiers { get; set; } = MOD_ALT;
+
+        public int ToggleVisibleKey { get; set; } = (int)Keys.H;
+        public int ToggleVisibleModifiers { get; set; } = MOD_CONTROL | MOD_SHIFT;
+
+        public int ToggleOverlayKey { get; set; } = (int)Keys.G;
+        public int ToggleOverlayModifiers { get; set; } = MOD_CONTROL | MOD_SHIFT;
+
+        public int StartMultiKey { get; set; } = (int)Keys.T;
+        public int StartMultiModifiers { get; set; } = MOD_CONTROL | MOD_SHIFT;
+
+        public int SetBaselineKey { get; set; } = 0;
+        public int SetBaselineModifiers { get; set; } = 0;
+        public int CancelBaselineKey { get; set; } = 0;
+        public int CancelBaselineModifiers { get; set; } = 0;
+        public bool SameKeyForBaseline { get; set; } = false;
+
+        public int Pause1Key { get; set; } = (int)Keys.Tab;
+        public int Pause1Modifiers { get; set; } = 0;
+
+        public int Pause2Key { get; set; } = (int)Keys.M;
+        public int Pause2Modifiers { get; set; } = 0;
+
+        // ========== 显示选项（带通知） ==========
         private bool _showDistance = true;
         private bool _showAngle = true;
         private bool _showVx = true;
@@ -55,80 +77,55 @@ namespace HLL_ATassistant
         public bool ShowBeta    { get => _showBeta;    set => Set(ref _showBeta, value); }
         public bool ShowTPrime  { get => _showTPrime;  set => Set(ref _showTPrime, value); }
 
-        // 其他全局设置
+        // ========== 窗体位置存储 ==========
+        public Point? MainFormLocation { get; set; }
+        public Point? SettingFormLocation { get; set; }
+
+        // ========== 其他全局设置 ==========
         public double Sensitivity { get; set; } = 1.0;
+        public double SmoothFactor { get; set; } = 0.2;
         public double MaxRange { get; set; } = 1000;
         public bool UseFixedMaxRange { get; set; } = true;
 
-        // 窗体位置存储
-        public System.Drawing.Point? MainFormLocation { get; set; }
-        public System.Drawing.Point? SettingFormLocation { get; set; }
+        // ========== INotifyPropertyChanged 实现 ==========
+        public event PropertyChangedEventHandler? PropertyChanged;
 
-        public event PropertyChangedEventHandler PropertyChanged;
-
-        private void Set<T>(ref T field, T value, [CallerMemberName] string propertyName = null)
+        private void Set<T>(ref T field, T value, [CallerMemberName] string? propertyName = null)
         {
             if (Equals(field, value)) return;
             field = value;
             PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(propertyName));
-            Save();
         }
 
-        /// <summary>
-        /// 从嵌入资源加载默认配置（出厂设置）
-        /// </summary>
-        private static AppSettings LoadDefaultFromResource()
+        // ========== 加载与保存 ==========
+        private static AppSettings LoadDefault()
         {
-            var assembly = Assembly.GetExecutingAssembly();
-            // 资源名称：项目默认命名空间 + 文件名（例如 "HLL_ATassistant.default_settings.json"）
-            string resourceName = "HLL_ATassistant.default_settings.json";
-            using (var stream = assembly.GetManifestResourceStream(resourceName))
-            {
-                if (stream != null)
-                {
-                    using (var reader = new StreamReader(stream))
-                    {
-                        string json = reader.ReadToEnd();
-                        try
-                        {
-                            return JsonConvert.DeserializeObject<AppSettings>(json) ?? new AppSettings();
-                        }
-                        catch
-                        {
-                            // 资源文件损坏，返回全新实例
-                            return new AppSettings();
-                        }
-                    }
-                }
-            }
-            // 没有嵌入资源，返回全新实例（默认值）
+            // 可扩展：从嵌入资源读取出厂设置，此处返回全新实例
             return new AppSettings();
         }
 
         public static AppSettings Load()
         {
-            // 如果用户配置文件存在，则加载；否则从嵌入资源加载默认配置
             if (File.Exists(ConfigPath))
             {
                 try
                 {
                     string json = File.ReadAllText(ConfigPath);
-                    return JsonConvert.DeserializeObject<AppSettings>(json) ?? LoadDefaultFromResource();
+                    return JsonSerializer.Deserialize<AppSettings>(json) ?? LoadDefault();
                 }
                 catch
                 {
                     // 文件损坏，使用默认配置
-                    return LoadDefaultFromResource();
+                    return LoadDefault();
                 }
             }
-            return LoadDefaultFromResource();
+            return LoadDefault();
         }
 
         public void Save()
         {
-            // 确保目录存在
             Directory.CreateDirectory(ConfigDir);
-            string json = JsonConvert.SerializeObject(this, Formatting.Indented);
+            string json = JsonSerializer.Serialize(this, new JsonSerializerOptions { WriteIndented = true });
             File.WriteAllText(ConfigPath, json);
         }
     }
