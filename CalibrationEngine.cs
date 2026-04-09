@@ -4,6 +4,9 @@ using System.Linq;
 
 namespace HLL_ATassistant
 {
+    /// <summary>
+    /// 校准引擎：负责多点拟合、参数计算、数据导入导出。
+    /// </summary>
     public class CalibrationEngine
     {
         public double Alpha { get; private set; }
@@ -13,18 +16,27 @@ namespace HLL_ATassistant
         public double MaxDeltaLimit { get; private set; }
         public List<CalibrationPoint> Points { get; } = new List<CalibrationPoint>();
 
-        public event Action CalibrationChanged;
+        public event Action? CalibrationChanged;
 
-        public void FitMultiPoints(bool useFixedMaxRange, double fixedMaxRange)
+        // 核心拟合逻辑（私有）
+        private (double bestAlpha, double bestV2G) FitInternal(
+            List<CalibrationPoint> points,
+            bool useFixedV2G,
+            double fixedV2G,
+            out double bestError)
         {
-            var validPoints = Points.Where(p => p.Delta > 0).ToList();
-            if (validPoints.Count < 2 && !useFixedMaxRange)
-                throw new InvalidOperationException("至少需要两个有效标定点");
+            var validPoints = points.Where(p => p.Delta > 0).ToList();
+            if (validPoints.Count == 0)
+                throw new InvalidOperationException("没有有效的标定点（Delta > 0）");
 
-            double maxDelta = validPoints.Count > 0 ? validPoints.Max(p => p.Delta) : 1;
-            double alphaMax = Math.PI / (2.0 * maxDelta) * 0.99;
-            int steps = 2000;
-            double bestAlpha = 0, bestV2G = 0, bestError = double.MaxValue;
+            if (!useFixedV2G && validPoints.Count < 2)
+                throw new InvalidOperationException("自动拟合模式下至少需要两个有效标定点");
+
+            double maxDelta = validPoints.Max(p => p.Delta);
+            double alphaMax = Math.PI / (2.0 * maxDelta);
+            const int steps = 2000;
+            double bestAlpha = 0, bestV2G = 0;
+            bestError = double.MaxValue;
 
             for (int i = 1; i <= steps; i++)
             {
@@ -32,14 +44,13 @@ namespace HLL_ATassistant
                 bool valid = true;
                 double error = 0;
 
-                if (useFixedMaxRange)
+                if (useFixedV2G)
                 {
-                    if (validPoints.Count == 0) throw new InvalidOperationException("使用最大射程时仍需至少一个标定点");
                     foreach (var p in validPoints)
                     {
                         double arg = 2.0 * alpha * p.Delta;
                         if (arg <= 0 || arg >= Math.PI / 2.0) { valid = false; break; }
-                        double pred = fixedMaxRange * Math.Sin(arg);
+                        double pred = fixedV2G * Math.Sin(arg);
                         error += (pred - p.Distance) * (pred - p.Distance);
                     }
                     if (!valid) continue;
@@ -47,7 +58,7 @@ namespace HLL_ATassistant
                     {
                         bestError = error;
                         bestAlpha = alpha;
-                        bestV2G = fixedMaxRange;
+                        bestV2G = fixedV2G;
                     }
                 }
                 else
@@ -78,49 +89,47 @@ namespace HLL_ATassistant
                 }
             }
 
-            if (bestAlpha == 0) throw new InvalidOperationException("未能找到合适的参数");
+            if (bestAlpha == 0)
+                throw new InvalidOperationException("未能找到合适的拟合参数");
 
-            Alpha = bestAlpha;
-            V2G = bestV2G;
-            MaxDeltaLimit = useFixedMaxRange ? Math.Round(Math.PI / (4 * Alpha), 1) : validPoints.Max(p => p.Delta);
+            return (bestAlpha, bestV2G);
+        }
+
+        /// <summary>
+        /// 多点拟合（使用当前 Points 数据）
+        /// </summary>
+        public void FitMultiPoints(bool useFixedMaxRange, double fixedMaxRange)
+        {
+            var (alpha, v2g) = FitInternal(Points, useFixedMaxRange, fixedMaxRange, out _);
+            Alpha = alpha;
+            V2G = v2g;
+
+            if (useFixedMaxRange)
+                MaxDeltaLimit = Math.Round(Math.PI / (4 * Alpha), 1);
+            else
+                MaxDeltaLimit = Points.Where(p => p.Delta > 0).Max(p => p.Delta);
+
             CalibrationChanged?.Invoke();
         }
 
+        /// <summary>
+        /// 使用固定最大射程重新拟合
+        /// </summary>
         public void RecalculateWithFixedRange(double fixedMaxRange)
         {
-            if (Points.Count == 0) throw new InvalidOperationException("没有标定点");
-            double maxDelta = Points.Max(p => p.Delta);
-            double alphaMax = Math.PI / (2.0 * maxDelta) * 0.99;
-            int steps = 2000;
-            double bestAlpha = 0, bestError = double.MaxValue;
+            if (Points.Count == 0)
+                throw new InvalidOperationException("没有标定点");
 
-            for (int i = 1; i <= steps; i++)
-            {
-                double alpha = alphaMax * i / steps;
-                bool valid = true;
-                double error = 0;
-                foreach (var p in Points)
-                {
-                    double arg = 2.0 * alpha * p.Delta;
-                    if (arg <= 0 || arg >= Math.PI / 2.0) { valid = false; break; }
-                    double pred = fixedMaxRange * Math.Sin(arg);
-                    error += (pred - p.Distance) * (pred - p.Distance);
-                }
-                if (!valid) continue;
-                if (error < bestError)
-                {
-                    bestError = error;
-                    bestAlpha = alpha;
-                }
-            }
-
-            if (bestAlpha == 0) throw new InvalidOperationException("拟合失败");
-            Alpha = bestAlpha;
+            var (alpha, _) = FitInternal(Points, true, fixedMaxRange, out _);
+            Alpha = alpha;
             V2G = fixedMaxRange;
             MaxDeltaLimit = Math.Round(Math.PI / (4 * Alpha), 1);
             CalibrationChanged?.Invoke();
         }
 
+        /// <summary>
+        /// 从校准数据加载（反序列化）
+        /// </summary>
         public void LoadFromData(CalibrationData data)
         {
             Points.Clear();
@@ -129,11 +138,16 @@ namespace HLL_ATassistant
             V2G = data.V2G;
             G = data.G != 0 ? data.G : 9.8;
             MaxDeltaLimit = data.MaxDeltaLimit;
-            if (MaxDeltaLimit == 0 && Points.Count > 0) MaxDeltaLimit = Points.Max(p => p.Delta);
-            else if (MaxDeltaLimit == 0 && Alpha != 0) MaxDeltaLimit = Math.PI / (4 * Alpha);
+            if (MaxDeltaLimit == 0 && Points.Count > 0)
+                MaxDeltaLimit = Points.Max(p => p.Delta);
+            else if (MaxDeltaLimit == 0 && Alpha != 0)
+                MaxDeltaLimit = Math.PI / (4 * Alpha);
             CalibrationChanged?.Invoke();
         }
 
+        /// <summary>
+        /// 导出校准数据（用于序列化）
+        /// </summary>
         public CalibrationData ExportData() => new CalibrationData
         {
             Points = Points.Select(p => new CalibrationPointData { Delta = p.Delta, Distance = p.Distance }).ToList(),
@@ -144,6 +158,9 @@ namespace HLL_ATassistant
             MaxDeltaLimit = MaxDeltaLimit
         };
 
+        /// <summary>
+        /// 重置所有数据
+        /// </summary>
         public void Reset()
         {
             Points.Clear();
@@ -154,6 +171,7 @@ namespace HLL_ATassistant
         }
     }
 
+    // 辅助数据类
     public class CalibrationPoint
     {
         public double Distance { get; set; }
