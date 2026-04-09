@@ -1,116 +1,266 @@
 using System;
+using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Windows.Forms;
 
 namespace HLL_ATassistant
 {
-    public class HotKeyManager : IDisposable
+    /// <summary>
+    /// 全局热键管理器：使用低级键盘钩子监听热键，并管理状态机。
+    /// 热键的具体行为定义在 HotKeyManager.Events.cs 中。
+    /// </summary>
+    public partial class HotKeyManager : IDisposable
     {
-        private IntPtr _hwnd;
-        private AppSettings _settings;
-        private const int WM_HOTKEY = 0x0312;
+        // 状态机模式
+        public enum Mode
+        {
+            Idle,               // 未校准或无数据
+            MultiCalibrating,   // 多点校准中
+            Measuring,          // 普通测量模式
+            HeightDiff          // 高低差测量模式（已设置基准点）
+        }
 
-        // 注册结果回调（可选），参数：热键名称，是否成功
-        public event Action<string, bool> HotKeyRegistered;
+        private readonly IntPtr _hwnd;
+        private readonly AppSettings _settings;
+        private readonly MainForm _mainForm;
 
-        public event Action B1Pressed;
-        public event Action B2Pressed;
-        public event Action ToggleVisiblePressed;
-        public event Action ToggleOverlayPressed;
-        public event Action StartMultiPressed;
-        public event Action SetBaselinePressed;
-        public event Action CancelBaselinePressed;
+        private Mode _currentMode = Mode.Idle;
+        public Mode CurrentMode => _currentMode;
 
-        public HotKeyManager(IntPtr hwnd, AppSettings settings)
+        private bool _heightDiffBaselineSet = false;
+        public bool HeightDiffBaselineSet
+        {
+            get => _heightDiffBaselineSet;
+            private set
+            {
+                if (_heightDiffBaselineSet != value)
+                {
+                    _heightDiffBaselineSet = value;
+                    OnBaselineSetChanged?.Invoke(value);
+                    UpdateMode();
+                }
+            }
+        }
+
+        // 暂停标志
+        private bool _pause1Active = false, _pause2Active = false;
+        public void SetPauseFlags(bool pause1, bool pause2)
+        {
+            _pause1Active = pause1;
+            _pause2Active = pause2;
+            SetBetaPaused(pause1 || pause2);
+        }
+
+        private bool _betaPaused = false;
+        public bool BetaPaused => _betaPaused;
+        private void SetBetaPaused(bool paused) => _betaPaused = paused;
+
+        // 事件
+        public event Action<bool>? OnBaselineSetChanged;
+        public event Action<Mode>? OnModeChanged;
+
+        // 鼠标跟踪器
+        private MouseDeltaTracker MouseTracker => MouseDeltaTracker.Instance;
+
+        // ==================== 键盘钩子相关 ====================
+        private const int WH_KEYBOARD_LL = 13;
+        private const int WM_KEYDOWN = 0x0100;
+        private const int WM_SYSKEYDOWN = 0x0104;
+
+        private delegate IntPtr LowLevelKeyboardProc(int nCode, IntPtr wParam, IntPtr lParam);
+        private LowLevelKeyboardProc _proc;
+        private IntPtr _hookID = IntPtr.Zero;
+
+        // 修饰键常量
+        private const int MOD_ALT = 0x0001;
+        private const int MOD_CONTROL = 0x0002;
+        private const int MOD_SHIFT = 0x0004;
+        // ======================================================
+
+        public HotKeyManager(IntPtr hwnd, AppSettings settings, MainForm mainForm)
         {
             _hwnd = hwnd;
             _settings = settings;
-            RegisterAll();
+            _mainForm = mainForm;
+
+            MouseDeltaTracker.Instance.SetBetaPausedProvider(() => this.BetaPaused);
+            MouseDeltaTracker.Instance.OnMiddleButtonPressed += OnB1;
+
+            // 安装键盘钩子
+            InstallKeyboardHook();
         }
 
         /// <summary>
-        /// 重新注册所有热键（设置变更后调用）
+        /// 重新注册所有热键（设置变更后调用）-> 实际为重新安装钩子
         /// </summary>
         public void ReRegister()
         {
-            RegisterAll();
+            UninstallKeyboardHook();
+            InstallKeyboardHook();
         }
 
-        private void RegisterAll()
+        /// <summary>
+        /// 由 MainForm 在状态变化时调用，更新内部模式
+        /// </summary>
+        public void NotifyStateChanged() => UpdateMode();
+
+        /// <summary>
+        /// 取消基准点（供外部调用，如关闭高低差模式时）
+        /// </summary>
+        public void CancelBaselineExternally() => OnCancelBaseline();
+
+        private void UpdateMode()
         {
-            UnregisterAll();
+            Mode newMode;
+            if (_mainForm.CurrentMode == MainForm.UIMode.MultiCalibrating)
+                newMode = Mode.MultiCalibrating;
+            else if (_mainForm.EnableHeightDiffMode && HeightDiffBaselineSet)
+                newMode = Mode.HeightDiff;
+            else if (_mainForm.EnableHeightDiffMode && !HeightDiffBaselineSet)
+                newMode = Mode.Measuring;
+            else if (_mainForm.CurrentMode == MainForm.UIMode.Measuring)
+                newMode = Mode.Measuring;
+            else
+                newMode = Mode.Idle;
 
-            // 注册各个热键，并捕获结果
-            RegisterWithFeedback("B1", HotKeyId.B1, _settings.B1Key, _settings.B1Modifiers);
-            RegisterWithFeedback("B2", HotKeyId.B2, _settings.B2Key, _settings.B2Modifiers);
-            RegisterWithFeedback("ToggleVisible", HotKeyId.ToggleVisible, _settings.ToggleVisibleKey, _settings.ToggleVisibleModifiers);
-            RegisterWithFeedback("ToggleOverlay", HotKeyId.ToggleOverlay, _settings.ToggleOverlayKey, _settings.ToggleOverlayModifiers);
-            RegisterWithFeedback("StartMulti", HotKeyId.StartMulti, _settings.StartMultiKey, _settings.StartMultiModifiers);
-            RegisterWithFeedback("SetBaseline", HotKeyId.SetBaseline, _settings.SetBaselineKey, _settings.SetBaselineModifiers);
-            RegisterWithFeedback("CancelBaseline", HotKeyId.CancelBaseline, _settings.CancelBaselineKey, _settings.CancelBaselineModifiers);
-        }
-
-        private void RegisterWithFeedback(string name, HotKeyId id, int key, int modifiers)
-        {
-            if (key == 0)
+            if (_currentMode != newMode)
             {
-                HotKeyRegistered?.Invoke(name, false);
-                return;
-            }
-
-            // 特殊处理：B1 如果设置为鼠标中键，则不注册（因为中键已通过 Raw Input 处理）
-            if (id == HotKeyId.B1 && key == (int)MouseButtons.Middle)
-            {
-                HotKeyRegistered?.Invoke(name, true); // 视为“成功”（因为不需要注册）
-                return;
-            }
-
-            bool success = RegisterHotKey(_hwnd, (int)id, (uint)modifiers, key);
-            HotKeyRegistered?.Invoke(name, success);
-            if (!success)
-            {
-                // 可以在这里记录日志，但为了不干扰用户，暂时不弹窗
-                System.Diagnostics.Debug.WriteLine($"热键 {name} 注册失败: key={key}, mod={modifiers}");
+                _currentMode = newMode;
+                OnModeChanged?.Invoke(newMode);
             }
         }
 
-        private void Register(HotKeyId id, int key, int modifiers)
+        // ==================== 键盘钩子实现 ====================
+        private void InstallKeyboardHook()
         {
-            if (key != 0)
-                RegisterHotKey(_hwnd, (int)id, (uint)modifiers, key);
+            if (_hookID != IntPtr.Zero) return;
+            _proc = HookCallback;
+            _hookID = SetHook(_proc);
         }
 
-        public void ProcessHotKey(int id)
+        private void UninstallKeyboardHook()
         {
-            switch ((HotKeyId)id)
+            if (_hookID != IntPtr.Zero)
             {
-                case HotKeyId.B1: B1Pressed?.Invoke(); break;
-                case HotKeyId.B2: B2Pressed?.Invoke(); break;
-                case HotKeyId.ToggleVisible: ToggleVisiblePressed?.Invoke(); break;
-                case HotKeyId.ToggleOverlay: ToggleOverlayPressed?.Invoke(); break;
-                case HotKeyId.StartMulti: StartMultiPressed?.Invoke(); break;
-                case HotKeyId.SetBaseline: SetBaselinePressed?.Invoke(); break;
-                case HotKeyId.CancelBaseline: CancelBaselinePressed?.Invoke(); break;
+                UnhookWindowsHookEx(_hookID);
+                _hookID = IntPtr.Zero;
             }
         }
 
-        private void UnregisterAll()
+        private IntPtr SetHook(LowLevelKeyboardProc proc)
         {
-            foreach (HotKeyId id in Enum.GetValues(typeof(HotKeyId)))
-                UnregisterHotKey(_hwnd, (int)id);
+            using (Process curProcess = Process.GetCurrentProcess())
+            using (ProcessModule curModule = curProcess.MainModule)
+            {
+                return SetWindowsHookEx(WH_KEYBOARD_LL, proc,
+                    GetModuleHandle(curModule.ModuleName), 0);
+            }
+        }
+
+        private IntPtr HookCallback(int nCode, IntPtr wParam, IntPtr lParam)
+        {
+            if (nCode >= 0 && (wParam == (IntPtr)WM_KEYDOWN || wParam == (IntPtr)WM_SYSKEYDOWN))
+            {
+                int vkCode = Marshal.ReadInt32(lParam);
+                Keys key = (Keys)vkCode;
+                int modifiers = GetModifiers();
+
+                if (MatchHotkey(key, modifiers, out Action action))
+                {
+                    // 异步执行动作，避免阻塞钩子
+                    _mainForm.BeginInvoke(action);
+                    // 注意：不返回1，让按键继续传递给其他应用程序
+                }
+            }
+            return CallNextHookEx(_hookID, nCode, wParam, lParam);
+        }
+
+        private int GetModifiers()
+        {
+            int mod = 0;
+            if ((Control.ModifierKeys & Keys.Control) != 0) mod |= MOD_CONTROL;
+            if ((Control.ModifierKeys & Keys.Alt) != 0) mod |= MOD_ALT;
+            if ((Control.ModifierKeys & Keys.Shift) != 0) mod |= MOD_SHIFT;
+            return mod;
+        }
+
+        private bool MatchHotkey(Keys key, int modifiers, out Action action)
+        {
+            action = null;
+
+            // B1（仅键盘键，鼠标中键已在 MouseDeltaTracker 中单独处理）
+            if (_settings.B1Key != (int)MouseButtons.Middle &&
+                (int)key == _settings.B1Key && modifiers == _settings.B1Modifiers)
+            {
+                action = () => OnB1();
+                return true;
+            }
+
+            // B2
+            if ((int)key == _settings.B2Key && modifiers == _settings.B2Modifiers)
+            {
+                action = () => OnB2();
+                return true;
+            }
+
+            // 切换主窗体可见性
+            if ((int)key == _settings.ToggleVisibleKey && modifiers == _settings.ToggleVisibleModifiers)
+            {
+                action = () => ToggleMainFormVisibility();
+                return true;
+            }
+
+            // 切换覆盖窗口可见性
+            if ((int)key == _settings.ToggleOverlayKey && modifiers == _settings.ToggleOverlayModifiers)
+            {
+                action = () => ToggleOverlayVisibility();
+                return true;
+            }
+
+            // 开始多点校准
+            if ((int)key == _settings.StartMultiKey && modifiers == _settings.StartMultiModifiers)
+            {
+                action = () => _mainForm.StartMultiCalibration();
+                return true;
+            }
+
+            // 设置基准点
+            if (_settings.SetBaselineKey != 0 &&
+                (int)key == _settings.SetBaselineKey && modifiers == _settings.SetBaselineModifiers)
+            {
+                action = () => OnSetBaseline();
+                return true;
+            }
+
+            // 取消基准点
+            if (_settings.CancelBaselineKey != 0 &&
+                (int)key == _settings.CancelBaselineKey && modifiers == _settings.CancelBaselineModifiers)
+            {
+                action = () => OnCancelBaseline();
+                return true;
+            }
+
+            return false;
         }
 
         public void Dispose()
         {
-            UnregisterAll();
+            UninstallKeyboardHook();
+            MouseDeltaTracker.Instance.OnMiddleButtonPressed -= OnB1;
         }
 
-        private enum HotKeyId { B1 = 1, B2, ToggleVisible, ToggleOverlay, StartMulti, SetBaseline, CancelBaseline }
+        // ==================== P/Invoke ====================
+        [DllImport("user32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+        private static extern IntPtr SetWindowsHookEx(int idHook, LowLevelKeyboardProc lpfn, IntPtr hMod, uint dwThreadId);
 
-        [DllImport("user32.dll")]
-        private static extern bool RegisterHotKey(IntPtr hWnd, int id, uint fsModifiers, int vk);
+        [DllImport("user32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool UnhookWindowsHookEx(IntPtr hhk);
 
-        [DllImport("user32.dll")]
-        private static extern bool UnregisterHotKey(IntPtr hWnd, int id);
+        [DllImport("user32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+        private static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+        private static extern IntPtr GetModuleHandle(string lpModuleName);
     }
 }
